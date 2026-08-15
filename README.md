@@ -79,6 +79,19 @@ Open `http://localhost:3000`. The single application container serves the
 frontend, diagram API, WebSocket collaboration endpoint, and SQLite storage.
 The Compose configuration persists the database in the `drawdb-data` volume.
 
+### Deployment
+
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full production guide: the
+security model, the complete environment variable reference, reverse proxy
+configuration for nginx and Caddy, backup and restore procedures, upgrades,
+running without Docker, and known operational limitations.
+
+> [!IMPORTANT]
+> The API and WebSocket endpoints are **unauthenticated**. Anyone who can reach
+> the port can read, modify, and delete every diagram. The server binds to
+> `127.0.0.1` by default for this reason. Put authentication in front of it
+> before exposing it beyond localhost.
+
 ### Collaborative self-hosting
 
 Diagrams are stored centrally in SQLite; IndexedDB is not used for diagram
@@ -100,7 +113,8 @@ Reconnects send the last known version and converge on the server snapshot.
 When running behind a reverse proxy, forward `X-Forwarded-For` and
 `X-Forwarded-Proto`, and allow WebSocket `Upgrade`/`Connection` headers on the
 `/ws` path. The browser derives `ws://` or `wss://` from the current origin, so
-no public hostname or `localhost` value is required in production.
+no public hostname or `localhost` value is required in production. Worked nginx
+and Caddy examples are in [DEPLOYMENT.md](DEPLOYMENT.md#running-behind-a-reverse-proxy).
 
 ## Contributing
 
