@@ -18,7 +18,9 @@ export function createApplication({ databasePath, staticPath } = {}) {
   const store = createDiagramStore(database);
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", 1);
+  // X-Forwarded-For is only trustworthy when a reverse proxy is guaranteed in
+  // front of us. Opt in explicitly rather than trusting whoever connects.
+  if (process.env.TRUST_PROXY === "1") app.set("trust proxy", 1);
   app.use(express.json({ limit: MAX_DOCUMENT_BYTES }));
 
   const validId = (req, res, next) => {
@@ -45,6 +47,13 @@ export function createApplication({ databasePath, staticPath } = {}) {
         return;
       }
       const requestedId = req.body.id;
+      if (requestedId !== undefined && typeof requestedId !== "string") {
+        // A null id used to slip past `??` and then be written straight to a
+        // TEXT PRIMARY KEY, which SQLite accepts, producing unreachable rows
+        // that the duplicate check could never match.
+        res.status(400).json({ error: "Invalid diagram ID" });
+        return;
+      }
       const id = requestedId ?? crypto.randomUUID();
       if (!DIAGRAM_ID_PATTERN.test(id)) {
         res.status(400).json({ error: "Invalid diagram ID" });
@@ -54,7 +63,11 @@ export function createApplication({ databasePath, staticPath } = {}) {
         res.status(409).json({ error: "Diagram already exists" });
         return;
       }
-      res.status(201).json(store.create({ id, ...req.body }));
+      // Fields are named explicitly: spreading the body would let a client
+      // override the validated id.
+      res.status(201).json(
+        store.create({ id, name: req.body.name, document: req.body.document }),
+      );
     } catch (error) {
       next(error);
     }
@@ -65,7 +78,12 @@ export function createApplication({ databasePath, staticPath } = {}) {
     else res.json(diagram);
   });
   app.put("/api/diagrams/:id", validId, (req, res) => {
-    if (!validPayload(req.body) || !Number.isInteger(req.body.baseVersion)) {
+    if (
+      !validPayload(req.body) ||
+      !Number.isInteger(req.body.baseVersion) ||
+      (req.body.operationId !== undefined &&
+        typeof req.body.operationId !== "string")
+    ) {
       res
         .status(400)
         .json({
@@ -73,7 +91,13 @@ export function createApplication({ databasePath, staticPath } = {}) {
         });
       return;
     }
-    const result = store.updateSnapshot({ id: req.params.id, ...req.body });
+    const result = store.updateSnapshot({
+      id: req.params.id,
+      name: req.body.name,
+      document: req.body.document,
+      baseVersion: req.body.baseVersion,
+      operationId: req.body.operationId,
+    });
     if (result.status === "not_found")
       res.status(404).json({ error: "Diagram not found" });
     else if (result.status === "conflict") {
@@ -111,9 +135,20 @@ export function createApplication({ databasePath, staticPath } = {}) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  // The API and WebSocket are unauthenticated, so a stray listener is a
+  // full read/write/delete surface. Keep the process alive on unexpected
+  // errors rather than letting one bad frame take every room down.
+  process.on("uncaughtException", (error) => {
+    console.error("Uncaught exception:", error);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled rejection:", reason);
+  });
+
   const port = Number.parseInt(process.env.PORT || "3000", 10);
+  const host = process.env.BIND_HOST || "127.0.0.1";
   const { server } = createApplication();
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`drawDB listening on http://0.0.0.0:${port}`);
+  server.listen(port, host, () => {
+    console.log(`drawDB listening on http://${host}:${port}`);
   });
 }

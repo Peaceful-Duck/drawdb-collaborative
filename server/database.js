@@ -21,7 +21,9 @@ export function openDatabase(databasePath = process.env.DATABASE_PATH) {
   db.pragma("foreign_keys = ON");
   db.exec(`
     CREATE TABLE IF NOT EXISTS diagrams (
-      id TEXT PRIMARY KEY,
+      -- SQLite permits NULL in a TEXT PRIMARY KEY unless NOT NULL is declared,
+      -- which would let a null id insert unreachable rows without deduping.
+      id TEXT PRIMARY KEY NOT NULL,
       name TEXT NOT NULL,
       document TEXT NOT NULL,
       version INTEGER NOT NULL DEFAULT 1,
@@ -80,7 +82,14 @@ export function createDiagramStore(db) {
     },
   );
 
+  const selectExists = db.prepare("SELECT 1 FROM diagrams WHERE id = ?");
+
   return {
+    // Existence check that avoids reading and JSON.parse-ing the whole
+    // document, which the WebSocket upgrade path does on every connection.
+    exists(id) {
+      return selectExists.get(id) !== undefined;
+    },
     list() {
       return db
         .prepare(

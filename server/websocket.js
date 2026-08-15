@@ -10,12 +10,36 @@ import {
 } from "./protocol.js";
 import { createTableLockManager } from "./tableLocks.js";
 
+/* global process */
+
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
 
-function send(socket, message) {
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message));
+// WebSocket upgrades are exempt from the same-origin policy, so without this
+// check any page a user visits can open a socket to their instance and read or
+// overwrite diagrams. Browsers always send Origin; a missing one means a
+// non-browser client (tests, wscat), which same-origin policy never protected.
+function isAllowedOrigin(origin, host) {
+  if (!origin) return true;
+  const allowList = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (allowList.includes(origin)) return true;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
   }
+}
+
+function sendRaw(socket, data) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(data);
+  }
+}
+
+function send(socket, message) {
+  sendRaw(socket, JSON.stringify(message));
 }
 
 export function attachCollaborationServer(server, store) {
@@ -27,8 +51,13 @@ export function attachCollaborationServer(server, store) {
   const tableLocks = createTableLockManager();
 
   const broadcast = (diagramId, message, except = null) => {
-    for (const client of rooms.get(diagramId) || []) {
-      if (client !== except) send(client, message);
+    const room = rooms.get(diagramId);
+    if (!room) return;
+    // Serialize once for the whole room: documents reach 2MB and this used to
+    // run JSON.stringify per recipient.
+    const data = JSON.stringify(message);
+    for (const client of room) {
+      if (client !== except) sendRaw(client, data);
     }
   };
 
@@ -52,22 +81,39 @@ export function attachCollaborationServer(server, store) {
   };
 
   server.on("upgrade", (request, socket, head) => {
-    const url = new URL(request.url, "http://localhost");
-    const match = url.pathname.match(/^\/ws\/diagrams\/([^/]+)$/);
-    const diagramId = match?.[1];
-    if (
-      !diagramId ||
-      !DIAGRAM_ID_PATTERN.test(diagramId) ||
-      !store.get(diagramId)
-    ) {
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      ws.diagramId = diagramId;
-      wss.emit("connection", ws, request);
+    // A raw socket with no error listener throws on ECONNRESET, which would
+    // take the process down before the upgrade even completes.
+    socket.on("error", (error) => {
+      console.error("Upgrade socket error:", error.message);
     });
+    const reject = (status) => {
+      socket.write(`HTTP/1.1 ${status}\r\n\r\n`);
+      socket.destroy();
+    };
+    try {
+      const url = new URL(request.url, "http://localhost");
+      const match = url.pathname.match(/^\/ws\/diagrams\/([^/]+)$/);
+      const diagramId = match?.[1];
+      if (!diagramId || !DIAGRAM_ID_PATTERN.test(diagramId)) {
+        reject("404 Not Found");
+        return;
+      }
+      if (!isAllowedOrigin(request.headers.origin, request.headers.host)) {
+        reject("403 Forbidden");
+        return;
+      }
+      if (!store.exists(diagramId)) {
+        reject("404 Not Found");
+        return;
+      }
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        ws.diagramId = diagramId;
+        wss.emit("connection", ws, request);
+      });
+    } catch (error) {
+      console.error("Upgrade failed:", error.message);
+      reject("400 Bad Request");
+    }
   });
 
   wss.on("connection", (socket) => {
@@ -78,8 +124,11 @@ export function attachCollaborationServer(server, store) {
     socket.on("pong", () => {
       socket.isAlive = true;
     });
+    socket.on("error", (error) => {
+      console.error("Socket error:", error.message);
+    });
 
-    socket.on("message", (raw) => {
+    const handleClientMessage = (raw) => {
       let message;
       try {
         message = JSON.parse(raw.toString());
@@ -106,8 +155,17 @@ export function attachCollaborationServer(server, store) {
           });
           return;
         }
-        socket.participant = message.participant;
         const diagram = store.get(diagramId);
+        if (!diagram) {
+          // The diagram can be deleted between the upgrade and the join.
+          send(socket, {
+            type: MESSAGE_TYPES.ERROR,
+            message: "Diagram not found",
+          });
+          socket.close();
+          return;
+        }
+        socket.participant = message.participant;
         send(socket, {
           type: MESSAGE_TYPES.JOINED,
           diagramId,
@@ -141,7 +199,12 @@ export function attachCollaborationServer(server, store) {
           Number.isInteger(message.baseVersion) &&
           isPlainObject(message.operation) &&
           message.operation.type === "snapshot.replace" &&
-          isPlainObject(message.operation.payload?.document);
+          isPlainObject(message.operation.payload?.document) &&
+          // An unvalidated name reaches better-sqlite3, which throws on any
+          // type it cannot bind.
+          (message.operation.payload.name === undefined ||
+            (typeof message.operation.payload.name === "string" &&
+              message.operation.payload.name.length <= 200));
         if (!valid) {
           send(socket, {
             type: MESSAGE_TYPES.ERROR,
@@ -156,6 +219,14 @@ export function attachCollaborationServer(server, store) {
           baseVersion: message.baseVersion,
           operationId: message.operationId,
         });
+        if (result.status === "not_found") {
+          // Deleted underneath us; result carries no diagram to read.
+          send(socket, {
+            type: MESSAGE_TYPES.ERROR,
+            message: "Diagram not found",
+          });
+          return;
+        }
         if (result.status === "conflict") {
           send(socket, {
             type: MESSAGE_TYPES.RESYNC_REQUIRED,
@@ -164,21 +235,36 @@ export function attachCollaborationServer(server, store) {
           });
           return;
         }
-        const applied = {
+        const ack = {
           type: MESSAGE_TYPES.OPERATION_APPLIED,
           diagramId,
           clientId: message.clientId,
           operationId: message.operationId,
           version: result.diagram.version,
-          operation: {
-            type: "snapshot.replace",
-            payload: {
-              name: result.diagram.name,
-              document: result.diagram.document,
+        };
+        if (result.status === "duplicate") {
+          // Already applied under this operation ID; acknowledge without
+          // replaying it to the room.
+          send(socket, ack);
+          return;
+        }
+        // The sender already has this document. Acknowledge it without echoing
+        // the payload back, and send the full operation to everyone else.
+        send(socket, ack);
+        broadcast(
+          diagramId,
+          {
+            ...ack,
+            operation: {
+              type: "snapshot.replace",
+              payload: {
+                name: result.diagram.name,
+                document: result.diagram.document,
+              },
             },
           },
-        };
-        broadcast(diagramId, applied);
+          socket,
+        );
         return;
       }
 
@@ -190,10 +276,12 @@ export function attachCollaborationServer(server, store) {
           });
           return;
         }
+        // isValidOperationPreview guarantees tableId, when present, names the
+        // same table as id, so the lock is checked against what actually moves.
         if (
           !tableLocks.owns(
             diagramId,
-            message.operation.payload.tableId ?? message.operation.payload.id,
+            message.operation.payload.id,
             socket.participant.clientId,
           )
         ) {
@@ -246,8 +334,16 @@ export function attachCollaborationServer(server, store) {
 
       if (message.type === MESSAGE_TYPES.TABLE_LOCK_RENEW) {
         if (
-          isValidEntityId(message.tableId) &&
-          Number.isInteger(message.token) &&
+          !isValidEntityId(message.tableId) ||
+          !Number.isInteger(message.token)
+        ) {
+          send(socket, {
+            type: MESSAGE_TYPES.ERROR,
+            message: "Invalid table lock renewal",
+          });
+          return;
+        }
+        if (
           tableLocks.renew(
             diagramId,
             message.tableId,
@@ -256,7 +352,15 @@ export function attachCollaborationServer(server, store) {
           )
         ) {
           broadcastTableLocks(diagramId);
+          return;
         }
+        // The lease is gone. Push current state so the client stops believing
+        // it holds a lock the server has already reassigned.
+        send(socket, {
+          type: MESSAGE_TYPES.TABLE_LOCK_STATE,
+          diagramId,
+          locks: tableLocks.list(diagramId),
+        });
         return;
       }
 
@@ -287,7 +391,10 @@ export function attachCollaborationServer(server, store) {
             clientId: socket.participant.clientId,
             x,
             y,
-            selected: typeof selected === "string" ? selected : null,
+            selected:
+              typeof selected === "string" && selected.length <= 128
+                ? selected
+                : null,
           },
           socket,
         );
@@ -302,6 +409,20 @@ export function attachCollaborationServer(server, store) {
         type: MESSAGE_TYPES.ERROR,
         message: "Unsupported message type",
       });
+    };
+
+    socket.on("message", (raw) => {
+      // Anything thrown here would otherwise be an uncaught exception that
+      // kills the process for every room, not just this connection.
+      try {
+        handleClientMessage(raw);
+      } catch (error) {
+        console.error("Message handling failed:", error);
+        send(socket, {
+          type: MESSAGE_TYPES.ERROR,
+          message: "Message could not be processed",
+        });
+      }
     });
 
     socket.on("close", () => {
