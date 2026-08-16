@@ -10,8 +10,25 @@ services:
     environment:
       PORT: 3000
       DATABASE_PATH: /data/drawdb.sqlite
+      # Read from a .env file next to this compose.yml, if present.
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
     volumes:
       - drawdb-data:/data
+
+  # Optional: Cloudflare Zero Trust tunnel, off by default. Requires
+  # CLOUDFLARE_TUNNEL_TOKEN in .env — see DEPLOYMENT.md#cloudflare-tunnel.
+  # Run with: docker compose --profile cloudflare up --build -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - drawdb
+    profiles:
+      - cloudflare
 
 volumes:
   drawdb-data:
