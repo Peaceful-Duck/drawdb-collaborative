@@ -112,6 +112,26 @@ Cookie-based SSO proxies (oauth2-proxy, etc.) work too — the WebSocket
 handshake is a normal HTTP request that carries cookies. Just don't let the
 proxy strip `Upgrade`.
 
+### Cloudflare Tunnel
+
+No open inbound port needed — `cloudflared` dials out to Cloudflare's edge.
+`compose.yml` ships it as an opt-in profile, off by default:
+
+1. Zero Trust dashboard → Networks → Tunnels → create a tunnel → copy its
+   token into `.env` as `CLOUDFLARE_TUNNEL_TOKEN`.
+2. Public hostname → service `http://drawdb:3000` (the compose service name,
+   not `localhost` — `cloudflared` reaches it over the compose network).
+3. `docker compose --profile cloudflare up --build -d`
+
+Set `TRUST_PROXY=1` in `.env`. `ALLOWED_ORIGINS` isn't needed — `cloudflared`
+preserves the original `Host` header by default, so it already matches
+`Origin`; only set it if you've overridden `httpHostHeader` in the tunnel
+config.
+
+The app still has no auth of its own — add a Cloudflare Access policy on the
+hostname (Zero Trust → Access → Applications) to gate it with SSO/email at
+the edge before traffic ever reaches the container.
+
 ## Backups
 
 WAL mode spreads state across three files (`drawdb.sqlite`, `-wal`, `-shm`).
