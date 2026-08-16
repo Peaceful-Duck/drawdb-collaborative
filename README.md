@@ -81,40 +81,20 @@ The Compose configuration persists the database in the `drawdb-data` volume.
 
 ### Deployment
 
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full production guide: the
-security model, the complete environment variable reference, reverse proxy
-configuration for nginx and Caddy, backup and restore procedures, upgrades,
-running without Docker, and known operational limitations.
+Diagrams are stored centrally in SQLite (not IndexedDB), and everyone opening
+the same `/diagrams/:diagramId` URL joins the same live session. Snapshot
+saves are optimistic-version guarded, so a stale client gets the current
+snapshot instead of overwriting it.
 
 > [!IMPORTANT]
 > The API and WebSocket endpoints are **unauthenticated**. Anyone who can reach
 > the port can read, modify, and delete every diagram. The server binds to
-> `127.0.0.1` by default for this reason. Put authentication in front of it
-> before exposing it beyond localhost.
+> `127.0.0.1` by default for this reason — don't expose it beyond localhost
+> without putting authentication in front of it.
 
-### Collaborative self-hosting
-
-Diagrams are stored centrally in SQLite; IndexedDB is not used for diagram
-storage. `DATABASE_PATH` controls the database location and defaults to
-`./data/drawdb.sqlite` outside the container. Diagram URLs use
-`/diagrams/:diagramId`, and everyone opening the same URL joins the same live
-session automatically.
-
-The application exposes:
-
-- `GET|POST /api/diagrams`
-- `GET|PUT|DELETE /api/diagrams/:diagramId`
-- `/ws/diagrams/:diagramId` (WebSocket)
-
-Snapshot saves are debounced and guarded by an optimistic version. Stale
-clients receive the current snapshot instead of silently overwriting it.
-Reconnects send the last known version and converge on the server snapshot.
-
-When running behind a reverse proxy, forward `X-Forwarded-For` and
-`X-Forwarded-Proto`, and allow WebSocket `Upgrade`/`Connection` headers on the
-`/ws` path. The browser derives `ws://` or `wss://` from the current origin, so
-no public hostname or `localhost` value is required in production. Worked nginx
-and Caddy examples are in [DEPLOYMENT.md](DEPLOYMENT.md#running-behind-a-reverse-proxy).
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full guide: the security model,
+environment variables, reverse proxy setup (nginx/Caddy), backups, upgrades,
+running without Docker, and known limitations.
 
 ## Contributing
 

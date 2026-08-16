@@ -10,6 +10,9 @@ services:
     environment:
       PORT: 3000
       DATABASE_PATH: /data/drawdb.sqlite
+      # Read from a .env file next to this compose.yml, if present.
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
     volumes:
       - drawdb-data:/data
 

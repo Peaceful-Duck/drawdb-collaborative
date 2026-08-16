@@ -1,84 +1,44 @@
 # Deployment
 
-This guide covers running drawDB Collaborative in production. For local
-development, see the "Local Development" section of the [README](README.md).
+Production guide for drawDB Collaborative. For local dev, see the
+[README](README.md#local-development).
 
-## Contents
+## Before you expose this anywhere
 
-- [Security model](#security-model)
-- [What gets deployed](#what-gets-deployed)
-- [Requirements](#requirements)
-- [Quick start with Docker Compose](#quick-start-with-docker-compose)
-- [Configuration reference](#configuration-reference)
-- [Running behind a reverse proxy](#running-behind-a-reverse-proxy)
-- [Data, persistence, and backups](#data-persistence-and-backups)
-- [Upgrading](#upgrading)
-- [Running without Docker](#running-without-docker)
-- [Operational notes and current limitations](#operational-notes-and-current-limitations)
-- [Troubleshooting](#troubleshooting)
+**The API and WebSocket are unauthenticated.** No accounts, no login, no
+per-diagram access control. Anyone who can reach the port can read, edit, and
+delete every diagram. Put one of these in front before exposing it beyond
+localhost:
 
-## Security model
+- An SSH tunnel or private tunnel (Tailscale, Cloudflare Tunnel, WireGuard).
+- A reverse proxy that enforces auth (basic auth, OAuth2 proxy, mTLS).
+- A network restriction (firewall rule, private VPC, VPN).
 
-**Read this before exposing the service to anything wider than localhost.**
+That's why `BIND_HOST` defaults to `127.0.0.1` and `compose.yml` publishes
+`127.0.0.1:3000:3000` instead of `3000:3000` — both are deliberate, don't widen
+either until something in front is doing the authentication.
 
-The HTTP API and the WebSocket endpoint are **unauthenticated**. There are no
-user accounts, no login, no per-diagram access control, and no rate limiting.
-Anyone who can reach the port can list, read, modify, and delete every diagram
-on the instance.
+## What runs
 
-The design assumes access control happens in front of the application. Choose
-one of these before exposing it:
+One container, four jobs:
 
-- Keep it on loopback and reach it through an SSH tunnel or a private tunnel
-  service (Tailscale, Cloudflare Tunnel, WireGuard).
-- Put it behind a reverse proxy that enforces authentication (HTTP basic auth,
-  an OAuth2 proxy, an identity-aware proxy, or an mTLS client certificate).
-- Restrict access at the network layer (firewall rule, private VPC, VPN).
-
-Two defaults enforce this posture, and both are deliberate:
-
-- `BIND_HOST` defaults to `127.0.0.1`, so a bare `npm start` never listens on a
-  public interface by accident.
-- `compose.yml` publishes the port as `127.0.0.1:3000:3000` rather than
-  `3000:3000`, so Docker does not punch a hole through the host firewall.
-
-Widening either one publishes an unauthenticated read/write/delete surface.
-Only do it once something in front of the app is doing the authentication.
-
-The container itself is reasonably hardened already: it runs as the unprivileged
-`node` user (uid 1000), ships only production dependencies, and carries no build
-toolchain into the runtime stage.
-
-## What gets deployed
-
-A single container serves all four concerns:
-
-| Concern | Path | Notes |
+| Job | Path | Notes |
 | --- | --- | --- |
-| Frontend | `/` | Static Vite build from `dist/`, with SPA fallback |
-| Diagram API | `/api/diagrams`, `/api/diagrams/:id` | JSON, 2 MB request body limit |
-| Collaboration | `/ws/diagrams/:diagramId` | WebSocket, 2 MB max frame |
-| Storage | `DATABASE_PATH` | SQLite in WAL mode, via `better-sqlite3` |
+| Frontend | `/` | Static Vite build, SPA fallback |
+| Diagram API | `/api/diagrams[/:id]` | JSON, 2 MB body limit |
+| Collaboration | `/ws/diagrams/:id` | WebSocket, 2 MB frame limit |
+| Storage | `DATABASE_PATH` | SQLite, WAL mode |
 
-There is no separate frontend deployment and no external database. The
-repository's `vercel.json` covers a **static, frontend-only** deployment of the
-upstream drawDB editor; it does not run the collaboration server, so a Vercel
-deployment gets no shared storage and no real-time sessions.
+No separate frontend host, no external database. `vercel.json` is for a
+**static-only** deployment of the editor — no server, no shared storage, no
+collaboration.
 
-## Requirements
+Requires Docker Compose v2, or Node.js `^20.19.0 || >=22.12.0` for bare metal
+(matches `package.json`'s `engines`; the Vite/Rolldown toolchain enforces it).
+`better-sqlite3` ships prebuilt binaries, so no C toolchain needed unless
+your platform lacks one.
 
-- Docker with Compose v2, for the container path.
-- Or Node.js `^20.19.0 || >=22.12.0` for a bare-metal install. The build
-  toolchain (Vite 8 / Rolldown) requires those minimums; older 20.x releases
-  will fail to build.
-- A build host with roughly 4 GB of memory available. The Dockerfile sets
-  `NODE_OPTIONS="--max-old-space-size=4096"` because the client bundle is large.
-- A C toolchain is **not** required on the host: `better-sqlite3` ships prebuilt
-  binaries for common platforms. If your platform has no prebuild, npm will fall
-  back to compiling from source and will need `python3`, `make`, and a C++
-  compiler.
-
-## Quick start with Docker Compose
+## Quick start
 
 ```bash
 git clone https://github.com/yms2772/drawdb-collaborative.git
@@ -86,158 +46,78 @@ cd drawdb-collaborative
 docker compose up --build -d
 ```
 
-Open `http://localhost:3000`. Diagram URLs have the form
-`/diagrams/:diagramId`, and everyone who opens the same URL joins the same live
-session automatically.
+Open `http://localhost:3000`. Diagram URLs are `/diagrams/:id`; anyone
+opening the same URL joins the same live session. Data persists in the
+`drawdb-data` volume — `docker compose down` keeps it, `down -v` deletes it.
 
-The compose service persists SQLite in the named volume `drawdb-data`, mounted
-at `/data`, and restarts unless explicitly stopped.
+The same Dockerfile builds the published image on every tag push
+(`.github/workflows/docker.yml`), for `linux/amd64` and `linux/arm64`, to
+`ghcr.io/<owner>/<repo>`.
 
-To follow logs or stop the stack:
+## Configuration
 
-```bash
-docker compose logs -f
-docker compose down
-```
-
-`docker compose down` leaves the `drawdb-data` volume intact. Adding `-v`
-deletes it along with every diagram, so avoid that flag unless you mean it.
-
-### Building the image directly
-
-```bash
-docker build -t drawdb-collaborative .
-docker run -d --name drawdb \
-  -p 127.0.0.1:3000:3000 \
-  -v drawdb-data:/data \
-  drawdb-collaborative
-```
-
-The published image is also built from this Dockerfile by the
-`.github/workflows/docker.yml` workflow on every pushed tag, for `linux/amd64`
-and `linux/arm64`, and pushed to `ghcr.io/<owner>/<repo>`.
-
-## Configuration reference
-
-All configuration is by environment variable. `.env.sample` documents the same
-set; copy it to `.env` for a bare-metal install.
+Copy `.env.sample` to `.env` and edit — Compose reads it automatically, and
+`npm start` reads it via your process manager or shell.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PORT` | `3000` | TCP port the HTTP and WebSocket server listens on. |
-| `BIND_HOST` | `127.0.0.1` | Interface to bind. The Docker image overrides this to `0.0.0.0`, because inside the container the listener must accept traffic from the bridge network — the container boundary and the compose port binding are what limit exposure there. |
-| `DATABASE_PATH` | `./data/drawdb.sqlite` | SQLite file location. The Docker image sets `/data/drawdb.sqlite`. Parent directories are created automatically. `:memory:` runs without persistence. |
-| `TRUST_PROXY` | unset | Set to `1` to make Express trust one proxy hop, so `X-Forwarded-For` and `X-Forwarded-Proto` are honoured. **Only set this when a reverse proxy is guaranteed to be in front** — otherwise clients can forge their own forwarded headers. |
-| `ALLOWED_ORIGINS` | unset | Comma-separated extra origins permitted to open a WebSocket, e.g. `https://drawdb.example.com`. Same-origin is always allowed, so this is only needed when the app is served from a different host than the one making the connection. |
-| `NODE_ENV` | unset | Set to `production` in the image. Not required by application logic. |
+| `PORT` | `3000` | Listen port. Fixed in `compose.yml`; edit the `ports:` line to change the published port. |
+| `BIND_HOST` | `127.0.0.1` | Interface to bind. Docker overrides to `0.0.0.0` — the container boundary and the compose port binding are what limit exposure there, not this. |
+| `DATABASE_PATH` | `./data/drawdb.sqlite` | SQLite file. `:memory:` disables persistence. |
+| `TRUST_PROXY` | unset | Set `1` once a reverse proxy is confirmed in front, so `X-Forwarded-*` headers are honored. Otherwise clients can forge them. |
+| `ALLOWED_ORIGINS` | unset | Comma-separated extra origins allowed to open a WebSocket. Same-origin always works; only needed when served from a different host. |
 
-Compose reads an `.env` file from the project directory automatically, or you
-can add an `env_file:` key to the service.
+Two limits are compiled in, not configurable: request bodies and WebSocket
+frames both cap at 2 MB (`MAX_DOCUMENT_BYTES` / `MAX_MESSAGE_BYTES` in
+`server/`). Oversized saves get `413`.
 
-### Non-configurable limits
+## Reverse proxy
 
-These are compiled in rather than exposed as environment variables:
-
-- 2 MB maximum JSON request body (`MAX_DOCUMENT_BYTES` in `server/index.js`).
-- 2 MB maximum WebSocket frame (`MAX_MESSAGE_BYTES` in `server/websocket.js`).
-
-Very large diagrams that exceed these will be rejected with `413` on save.
-
-## Running behind a reverse proxy
-
-The proxy must forward `X-Forwarded-For` and `X-Forwarded-Proto`, and must
-allow the WebSocket `Upgrade` and `Connection` headers through on the `/ws`
-path. Set `TRUST_PROXY=1` on the application once the proxy is in place.
-
-It must also preserve the original `Host` header. The WebSocket origin check
-compares the `Origin` header's host against the request's `Host`, so a proxy
-that rewrites `Host` to the upstream address makes every same-origin handshake
-fail with `403`. Either forward the real host, or list the public origin in
-`ALLOWED_ORIGINS`.
-
-The browser derives `ws://` or `wss://` from the page's own origin, so there is
-no public hostname or `localhost` value to configure anywhere in the frontend.
-
-### nginx
+Forward `X-Forwarded-For`/`X-Forwarded-Proto`, pass `Upgrade`/`Connection`
+through on `/ws`, and **preserve the `Host` header** — the WebSocket origin
+check compares `Origin` against `Host`, so rewriting `Host` breaks same-origin
+handshakes with a `403`. Set `TRUST_PROXY=1` once this is in place. The
+browser derives `ws://`/`wss://` from its own origin, so no hostname needs
+configuring in the frontend.
 
 ```nginx
-server {
-    listen 443 ssl;
-    server_name drawdb.example.com;
-
-    # ssl_certificate / ssl_certificate_key ...
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Required for the collaboration WebSocket.
-        proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        # Collaboration sessions are long-lived; the 60s default would cut
-        # idle editors off every minute.
-        proxy_read_timeout  3600s;
-        proxy_send_timeout  3600s;
-
-        # Diagram snapshots can approach the server's 2 MB body limit.
-        client_max_body_size 4m;
-    }
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;   # sessions are long-lived; default 60s kills idle editors
+    proxy_send_timeout 3600s;
+    client_max_body_size 4m;
 }
 ```
 
-### Caddy
-
-Caddy proxies WebSockets and sets the forwarded headers without extra
-configuration:
-
-```caddy
-drawdb.example.com {
-    reverse_proxy 127.0.0.1:3000
-}
-```
-
-### Adding authentication at the proxy
-
-Because the app has no authentication of its own, this is where you add it. The
-simplest option that works with WebSockets is HTTP basic auth — browsers replay
-the credentials on the `Upgrade` request:
+Caddy needs no extra config — `reverse_proxy 127.0.0.1:3000` forwards
+WebSockets and headers by default. Add auth there since the app has none:
 
 ```caddy
 drawdb.example.com {
     basic_auth {
-        # Generate with: caddy hash-password
-        alice $2a$14$...
+        alice $2a$14$...   # generate with: caddy hash-password
     }
     reverse_proxy 127.0.0.1:3000
 }
 ```
 
-Cookie-based SSO proxies (oauth2-proxy and similar) also work, since the
-WebSocket handshake is an ordinary HTTP request that carries cookies. Verify
-that whichever solution you choose does not strip the `Upgrade` header.
+Cookie-based SSO proxies (oauth2-proxy, etc.) work too — the WebSocket
+handshake is a normal HTTP request that carries cookies. Just don't let the
+proxy strip `Upgrade`.
 
-## Data, persistence, and backups
+## Backups
 
-All state lives in a single SQLite database at `DATABASE_PATH`, opened in WAL
-mode. WAL means the on-disk state is spread across three files:
-
-```
-drawdb.sqlite
-drawdb.sqlite-wal
-drawdb.sqlite-shm
-```
-
-**Copying only `drawdb.sqlite` while the server is running produces a torn
-backup.** Either stop the container and archive the whole volume, or take a
-consistent online backup with SQLite's `.backup` command.
-
-The runtime image is `node:22-bookworm-slim` and does **not** ship the `sqlite3`
-CLI, so the simplest reliable option is a cold copy of the volume:
+WAL mode spreads state across three files (`drawdb.sqlite`, `-wal`, `-shm`).
+Copying just `drawdb.sqlite` while the server runs produces a torn backup.
+The runtime image has no `sqlite3` CLI, so the simplest safe option is a cold
+volume copy:
 
 ```bash
 docker compose stop drawdb
@@ -246,21 +126,17 @@ docker run --rm -v drawdb-data:/data -v "$PWD":/backup alpine \
 docker compose start drawdb
 ```
 
-For a hot backup with no downtime, run `.backup` from a throwaway container that
-mounts the same volume and does have the CLI. `.backup` is consistent against a
-live writer, unlike `cp`:
+For zero-downtime backups, run SQLite's `.backup` (consistent against a live
+writer, unlike `cp`) from a throwaway container:
 
 ```bash
 docker run --rm -v drawdb-data:/data -v "$PWD":/backup \
   keinos/sqlite3 sqlite3 /data/drawdb.sqlite ".backup /backup/drawdb-backup.sqlite"
 ```
 
-To restore, stop the container, replace the volume contents, and start it
-again. Restore all three WAL files together, or restore a `.backup` output as
-the single `drawdb.sqlite` with the `-wal` and `-shm` files removed.
-
-Schema tables are created on startup with `CREATE TABLE IF NOT EXISTS`; there
-is no separate migration step to run.
+To restore: stop the container, replace the volume contents (all three WAL
+files together, or a `.backup` output as the sole `drawdb.sqlite`), start it
+again. Schema is `CREATE TABLE IF NOT EXISTS` on startup — no migration step.
 
 ## Upgrading
 
@@ -269,30 +145,25 @@ git pull
 docker compose up --build -d
 ```
 
-The volume survives the rebuild, so diagrams are preserved. Take a backup first
-if the upgrade crosses a release that changes the schema.
+The volume survives the rebuild. Back up first across a schema-changing
+release. Clients disconnect during restart, reconnect automatically, and
+converge on the server's snapshot rather than overwriting it.
 
-Connected clients are disconnected during the restart. They reconnect
-automatically, send their last known version, and converge on the server
-snapshot, so in-flight edits are not silently lost — a stale client receives the
-current snapshot rather than overwriting it.
-
-## Running without Docker
+## Without Docker
 
 ```bash
 git clone https://github.com/yms2772/drawdb-collaborative.git
 cd drawdb-collaborative
-npm ci
-npm run build
-cp .env.sample .env      # then edit
+npm ci && npm run build
+cp .env.sample .env   # then edit
 npm start
 ```
 
-`npm start` runs `node server/index.js`, which serves `dist/` if it exists. Run
-`npm run build` before starting, or the server will respond to page requests
-with 404s while the API and WebSocket still work.
+`npm start` serves `dist/` if it exists — build before starting or you'll get
+404s on pages while the API/WebSocket still work fine.
 
-A minimal systemd unit:
+<details>
+<summary>Minimal systemd unit</summary>
 
 ```ini
 [Unit]
@@ -307,10 +178,7 @@ EnvironmentFile=/opt/drawdb-collaborative/.env
 ExecStart=/usr/bin/node server/index.js
 Restart=on-failure
 RestartSec=5
-
-# Hardening
 NoNewPrivileges=true
-PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/drawdb-collaborative/data
@@ -319,70 +187,38 @@ ReadWritePaths=/opt/drawdb-collaborative/data
 WantedBy=multi-user.target
 ```
 
-## Operational notes and current limitations
+</details>
 
-Know these before putting the service on a critical path:
+## Know before you rely on this
 
-- **No authentication or authorization.** Covered above. This is the single
-  most important deployment consideration.
-- **No health check endpoint.** There is no `/healthz`, and neither the
-  Dockerfile nor `compose.yml` declares a `HEALTHCHECK`. Orchestrators that
-  need one should probe `GET /api/diagrams`, which returns `200` with a JSON
-  list once the server is up.
-- **No graceful shutdown.** The process installs no `SIGTERM` handler, so
-  `docker stop` waits the full timeout (10s by default) and then sends
-  `SIGKILL`. SQLite's WAL makes this safe for data integrity, but connected
-  WebSocket clients are dropped without a close frame. Node also runs as PID 1
-  in the container with no init process; add `init: true` to the compose service
-  if you want proper signal and zombie handling.
-- **The process deliberately survives crashes.** `uncaughtException` and
-  `unhandledRejection` are logged rather than fatal, so one malformed frame
-  cannot take every collaboration room down. The trade-off is that a genuinely
-  broken process keeps serving instead of restarting — watch the logs for
-  repeated `Uncaught exception:` lines.
-- **Single instance only.** State lives in one SQLite file and collaboration
-  rooms are held in that process's memory. Running two replicas behind a load
-  balancer will split sessions and corrupt nothing but will silently diverge.
-  Scale vertically, not horizontally.
-- **No log rotation or structured logging.** Output goes to stdout via
-  `console.log`/`console.error`. Use Docker's logging driver or systemd's
-  journal to bound it.
-- **Large client bundle.** The main JavaScript chunk is roughly 16 MB
-  uncompressed and 3 MB gzipped. Make sure compression is enabled at the proxy;
-  nginx needs `gzip on;` with `application/javascript` in `gzip_types`, and
-  Caddy compresses by default.
+- **No auth** — see the top of this doc.
+- **No health endpoint.** Probe `GET /api/diagrams` (returns `200` + JSON once
+  up) if your orchestrator needs one; nothing declares a `HEALTHCHECK`.
+- **No graceful shutdown.** No `SIGTERM` handler, so `docker stop` waits out
+  its timeout then `SIGKILL`s. Safe for SQLite (WAL), but WebSocket clients
+  drop without a close frame. Add `init: true` to the compose service for
+  proper PID 1 signal/zombie handling.
+- **Crashes are logged, not fatal.** `uncaughtException`/`unhandledRejection`
+  handlers keep the process alive so one bad frame doesn't kill every room —
+  but a genuinely broken process just keeps running. Watch for repeated
+  `Uncaught exception:` lines.
+- **Single instance only.** State is one SQLite file plus in-memory
+  collaboration rooms. Two replicas behind a load balancer silently split
+  sessions. Scale vertically.
+- **No log rotation.** Plain stdout — bound it with Docker's logging driver or
+  the systemd journal.
+- **Large JS bundle** (~16 MB / ~3 MB gzipped). Make sure the proxy
+  compresses responses (nginx: `gzip on;`; Caddy: on by default).
 
 ## Troubleshooting
 
-**Editors connect but changes never sync.** The WebSocket handshake is failing.
-Check the status code of the failed `/ws/diagrams/...` request in the browser's
-network panel:
-
-- `403 Forbidden` — the origin check rejected the handshake. The server compares
-  the `Origin` header's host against the request's `Host` header, so a proxy
-  that rewrites `Host` to `127.0.0.1` will fail this check. Forward the real
-  host (`proxy_set_header Host $host`), or list the public origin in
-  `ALLOWED_ORIGINS`.
-- `404 Not Found` — the diagram id does not exist, or the path is malformed.
-- No response / connection hangs — the proxy is not passing `Upgrade` and
-  `Connection` headers on `/ws`.
-
-**Sessions drop about once a minute.** The proxy's read timeout is closing idle
-WebSockets. Raise `proxy_read_timeout` as shown above.
-
-**Saves fail with `413 Request body is too large`.** The diagram exceeded the
-2 MB limit. Raise `MAX_DOCUMENT_BYTES` in `server/index.js` and
-`MAX_MESSAGE_BYTES` in `server/websocket.js` together, plus
-`client_max_body_size` at the proxy, then rebuild.
-
-**`SQLITE_CANTOPEN` on startup.** The process cannot write to `DATABASE_PATH`'s
-directory. In Docker this usually means a bind mount is owned by root while the
-container runs as uid 1000; `chown 1000:1000` the host directory, or use a named
-volume, which the image's `install -d -o node -g node /data` already handles.
-
-**Build fails with an out-of-memory error.** Raise the value in
-`NODE_OPTIONS="--max-old-space-size=4096"`, or build the image on a larger host
-and deploy the resulting image instead of building in place.
-
-**Everything returns 404 except `/api`.** `dist/` is missing. Run
-`npm run build` before `npm start`.
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Editors connect, changes don't sync, `/ws` request shows `403` | Origin check rejected the handshake — proxy rewrote `Host` | Forward the real `Host`, or add the origin to `ALLOWED_ORIGINS` |
+| `/ws` request shows `404` | Diagram doesn't exist, or malformed path | Check the diagram id |
+| `/ws` hangs, never upgrades | Proxy isn't passing `Upgrade`/`Connection` | Add those proxy headers |
+| Sessions drop every ~60s | Proxy's idle timeout is closing the socket | Raise `proxy_read_timeout` |
+| Save fails, `413` | Diagram exceeds the 2 MB limit | Raise `MAX_DOCUMENT_BYTES`/`MAX_MESSAGE_BYTES` and rebuild, plus `client_max_body_size` at the proxy |
+| `SQLITE_CANTOPEN` on startup | Can't write `DATABASE_PATH`'s directory — usually a root-owned bind mount vs. uid 1000 | `chown 1000:1000` the host dir, or use a named volume |
+| Build OOMs | Bundle needs more heap than available | Raise `--max-old-space-size` in the Dockerfile, or build on a bigger host |
+| Everything 404s except `/api` | `dist/` missing | Run `npm run build` before `npm start` |
