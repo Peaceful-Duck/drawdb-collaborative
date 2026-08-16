@@ -115,13 +115,10 @@ proxy strip `Upgrade`.
 ### Cloudflare Tunnel
 
 No open inbound port needed — `cloudflared` dials out to Cloudflare's edge.
-`compose.yml` ships it as an opt-in profile, off by default:
-
-1. Zero Trust dashboard → Networks → Tunnels → create a tunnel → copy its
-   token into `.env` as `CLOUDFLARE_TUNNEL_TOKEN`.
-2. Public hostname → service `http://drawdb:3000` (the compose service name,
-   not `localhost` — `cloudflared` reaches it over the compose network).
-3. `docker compose --profile cloudflare up --build -d`
+Run `cloudflared` as a host-level service (`cloudflared service install`,
+outside this repo) and point its ingress at `service: http://localhost:3000`
+— not the compose service name, `cloudflared` isn't part of the compose
+network here.
 
 Set `TRUST_PROXY=1` in `.env`. `ALLOWED_ORIGINS` isn't needed — `cloudflared`
 preserves the original `Host` header by default, so it already matches
